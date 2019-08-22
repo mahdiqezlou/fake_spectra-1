@@ -79,11 +79,16 @@ class Spectra(object):
                      Other options are "voronoi" which forces the Voronoi kernel, "tophat" which forces a flat tophat
                      kernel (a good back up for large Arepo simulations) or "sph" for an SPH kernel.
     """
-    def __init__(self,num, base,cofm, axis, res=1., cdir=None, savefile="spectra.hdf5", savedir=None, reload_file=False, snr = 0., spec_res = 0,load_halo=False, units=None, sf_neutral=True,quiet=False, load_snapshot=True, gasprop=None, gasprop_args=None, kernel=None):
+    def __init__(self,num, base, MPI, comm,cofm, axis, res=1., cdir=None, savefile="spectra.hdf5", savedir=None, reload_file=False, snr = 0., spec_res = 0,load_halo=False, units=None, sf_neutral=True,quiet=False, load_snapshot=True, gasprop=None, gasprop_args=None, kernel=None):
         #Present for compatibility. Functionality moved to HaloAssignedSpectra
         _= load_halo
         self.num = num
         self.base = base
+
+
+        self.MPI = MPI
+        self.comm = comm
+        self.rank = comm.Get_rank()
         #Create the unit system
         if units is not None:
             self.units = units
@@ -606,11 +611,34 @@ class Spectra(object):
         #Declare variables
         found = 0
         wanted = ndla
+        size_ind = None
         cofm_DLA = np.empty_like(self.cofm)[:ndla, :]
         #Filter
         #Note: line does nothing
         col_den = self.compute_spectra(elem,ion,1215,False)
-        ind = self.filter_DLA(col_den, thresh)
+        cdsum = np.sum(col_den, axis=1)
+        #make sure array elemnts are contiguous
+        cdsum = np.ascontiguousarray(cdsum, np.float32)
+        # A variable for comm.Reduce()
+        cdsum_added = np.zeros_like(cdsum)
+        #ind = self.filter_DLA(col_den, thresh)
+        
+        ### Call manager rank here
+        self.comm.Reduce(cdsum, cdsum_added, op = self.MPI.SUM, root=0)
+
+
+        if self.rank == 0:
+            ind = self.filter_DLA(cdsum_added, thresh)
+            ind = ind[0]
+            size_ind = np.size(ind)
+
+        size_ind = self.comm.bcast(size_ind, root=0)
+
+        if self.rank != 0 :
+            ind = np.zeros(size_ind, dtype= np.int)
+
+
+        self.comm.Bcast(ind, root=0)
         H1_DLA = np.empty_like(col_den)
         #Update saves
         top = np.min([wanted, found+np.size(ind)])
@@ -620,10 +648,30 @@ class Spectra(object):
         self.discarded = self.NumLos-np.size(ind)
         print("Discarded: ",self.discarded)
         while found < wanted:
+            
+            size_ind = None
             #Get a bunch of new spectra
             self.cofm = self.get_cofm()
             col_den = self.compute_spectra(elem,ion,1215,False)
-            ind = self.filter_DLA(col_den, thresh)
+            cdsum = np.sum(col_den, axis = 1)
+            cdsum_added = np.zeros_like(cdsum)
+            
+            ### CAll manager rank here
+            self.comm.Reduce(cdsum, cdsum_added, op=self.MPI.SUM, root=0)
+            
+            if self.rank == 0 :
+                ind = self.filter_DLA(cdsum_added, thresh)
+                ind = ind[0]
+                size_ind = np.size(ind)
+
+            size_ind = self.comm.bcast(size_ind, root=0)
+
+            if self.rank != 0:
+                ind = np.zeros(size_ind, dtype=np.int)
+
+
+            self.comm.Bcast(ind, root=0)
+            
             #Update saves
             top = np.min([wanted, found+np.size(ind)])
             cofm_DLA[found:top] = self.cofm[ind][:top-found,:]
