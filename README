@@ -1,8 +1,5 @@
-This branch is to run fake_spectra on a single fof group on TNG simukations.
-So in randspectra call, argument like 
-file_num =447
-is needed.
-
+This branch should be the **parallel version** which **does not use the ratenetwork**. I am going to test it on appropriate
+TNG snapshots.
 
 
 -------------------------------------------------
