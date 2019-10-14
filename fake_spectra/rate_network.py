@@ -146,15 +146,16 @@ class RateNetwork(object):
         """Same as above, but get electrons per proton."""
         return self.get_equilib_ne(density, ienergy, helium)/(density*(1-helium))
 
-    def get_neutral_fraction(self, density, ienergy, ne, helium=0.24):
+    def get_neutral_fraction(self, density, ienergy, helium=0.24):
         """Get the neutral hydrogen fraction at a given temperature and density.
         density is gas density in protons/cm^3
         Internal energy is in J/kg == 10^-10 ergs/g.
         helium is a mass fraction.
         """
-
-        temp = self._get_temp(ne, ienergy, helium)
-        return self._nH0(1, temp, ne)
+        nebynh = self.get_ne_by_nh(density, ienergy)
+        nh = density*(1-helium)
+        temp = self._get_temp(nebynh, ienergy)
+        return self._nH0(nh, temp, nebynh*nh)
 
     def _nH0(self, nh, temp, ne):
         """The neutral hydrogen number density. Eq. 33 of KWH."""
@@ -258,7 +259,8 @@ class RateNetwork(object):
         #m_P is the proton mass
         #μ is 1 / (mean no. molecules per unit atomic weight) calculated in loop.
         #Internal energy units are 10^-10 erg/g
-        helium = 0.24 # temporarily added to avoid helium being a large array
+
+        helium = 0.24 # I temporary added this, otherwise helium would be a large array
         hy_mass = 1 - helium
         muienergy = 4 / (hy_mass * (3 + 4*nebynh) + 1)*ienergy*1e10
         #Boltzmann constant (cgs)
