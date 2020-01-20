@@ -80,7 +80,7 @@ class Spectra:
                      kernel (a good back up for large Arepo simulations) "quintic" for a quintic SPh kernel as used in modern SPH
                      and "cubic" or "sph" for an old-school cubic SPH kernel.
     """
-    def __init__(self,num, base,cofm, axis, res=1., cdir=None, savefile="spectra.hdf5", savedir=None, reload_file=False, snr = 0., spec_res = 0,load_halo=False, units=None, sf_neutral=True,quiet=False, load_snapshot=True, gasprop=None, gasprop_args=None, kernel=None):
+    def __init__(self,num, base,cofm, axis, res=1., cdir=None, savefile="spectra.hdf5", savedir=None, reload_file=False, snr = [0.], spec_res = 0,load_halo=False, units=None, sf_neutral=True,quiet=False, load_snapshot=True, gasprop=None, gasprop_args=None, kernel=None):
         #Present for compatibility. Functionality moved to HaloAssignedSpectra
         _= load_halo
         self.num = num
@@ -107,7 +107,7 @@ class Spectra:
         self.num_important = {}
         self.discarded=0
         self.npart=0
-        #If greater than zero, will add noise to spectra when they are loaded.
+        #If greater than zero, will add noise to spectra when they are loaded. You should pass an array with the size of ndla (each spectrum has a different snr)
         self.snr = snr
         self.spec_res = spec_res
         self.cdir = cdir
@@ -325,7 +325,7 @@ class Spectra:
             raise ValueError("Not supported")
         f.close()
 
-    def add_noise(self, snr, tau, seed):
+    def add_noise(self, snr, tau, spec_num):
         """Compute a Gaussian noise vector from the flux variance and the SNR, as computed from optical depth"""
         flux = np.exp(-tau)
         if np.size(np.shape(flux)) == 1:
@@ -335,12 +335,12 @@ class Spectra:
         #This is to get around the type rules.
         if lines == 1:
             #This ensures that we always get the same noise for the same spectrum
-            np.random.seed(seed)
-            flux += np.random.normal(0, 1./snr, self.nbins)
+            np.random.seed(spec_num)
+            flux += np.random.normal(0, 1./snr[spec_num], self.nbins)
         else:
             for ii in xrange(lines):
                 np.random.seed(ii)
-                flux[ii]+=np.random.normal(0,1./snr, self.nbins)
+                flux[ii]+=np.random.normal(0,1./snr[ii], self.nbins)
         #Make sure we don't have negative flux
         ind = np.where(flux > 0)
         tau[ind] = -np.log(flux[ind])
@@ -799,11 +799,93 @@ class Spectra:
             if np.any(corrflux <= 0):
                 raise Exception
             tau = - np.log(corrflux)
-        if noise and self.snr > 0:
+        if noise and np.any(self.snr) > 0:
             tau = self.add_noise(self.snr, tau, number)
         return tau
-    
-    
+
+    def _vel_single_file(self,fn, elem, ion):
+        """Get the column density weighted interpolated velocity field for a single file"""
+        (pos, vel, elem_den, temp, hh, amumass) = self._read_particle_data(fn, elem, ion,True)
+        if amumass is False:
+            return np.zeros([np.shape(self.cofm)[0],self.nbins,3],dtype=np.float32)
+        line = self.lines[("H",1)][1215]
+        vv =  np.empty([np.shape(self.cofm)[0],self.nbins,3],dtype=np.float32)
+        phys = self.dvbin/self.velfac*self.rscale
+        for ax in (0,1,2):
+            weight = vel[:,ax]*np.sqrt(self.atime)
+            vv[:,:,ax] = self._do_interpolation_work(pos, vel, elem_den*weight/phys, temp, hh, amumass, line, False)
+        return vv
+
+    def _vel_width_bound(self, tau):
+        """Find the 0.05 and 0.95 bounds of the integrated optical depth"""
+        #Zero everything less than 1 sigma significant
+        cum_tau = np.cumsum(tau)
+        #Use spline interpolation to find the edge of the bins.
+        tdiff = cum_tau - 0.95*cum_tau[-1]
+        high = np.where(tdiff >= 0)[0][0]
+        tdiff = cum_tau - 0.05*cum_tau[-1]
+        low = np.where(tdiff >= 0)[0][0]
+        return (low, high)
+
+
+    def find_absorber_width(self, elem, ion, chunk = 20, minwidth=None):
+        """
+           Find the region in velocity space considered to be an absorber for each spectrum.
+           This is defined to be the maximum of 1000 km/s and the region over which there is "significant"
+           absorption in the strongest line for this ion, where strongest is the line with the largest
+           cross-section, ie, greatest lambda * fosc.
+           elem, ion - ion to look at
+           This line will be highly saturated, so consider significant absorption as F < 3/snr,
+           or F < 0.15 for no noise (and an assumed SNR of 20).
+           Returns the low and high indices of absorption, and the offset for the maximal absorption.
+        """
+        if minwidth is None:
+            minwidth = self.minwidth
+        try:
+            return self.absorber_width[(elem, ion, minwidth)]
+        except KeyError:
+            pass
+        if self.snr > 0:
+            thresh = - np.log(1-4./self.snr)
+        else:
+            thresh = -np.log(1-0.15)
+        lines = self.lines[(elem,ion)]
+        strength = [ll.fosc_X*ll.lambda_X for ll in lines.values()]
+        ind = np.where(strength == np.max(strength))[0][0]
+        #Lines are indexed by wavelength
+        strlam = int(list(lines.values())[ind].lambda_X)
+        #Absorption in a strong line: eg, SiII1260.
+        strong = self.get_tau(elem, ion, strlam)
+        (offset, roll) = spec_utils.get_rolled_spectra(strong)
+        #Minimum
+        if 0 < minwidth < self.nbins/2:
+            low  = int(self.nbins/2-minwidth/self.dvbin)*np.ones(self.NumLos, dtype=np.int)
+            high = int(self.nbins/2+minwidth/self.dvbin)*np.ones(self.NumLos, dtype=np.int)
+        else:
+            low = np.zeros(self.NumLos, dtype=np.int)
+            high = self.nbins*np.ones(self.NumLos, dtype=np.int)
+        for ii in xrange(self.NumLos):
+            #First expand the search area in case there is absorption at the edges.
+            for i in xrange(low[ii],0,-chunk):
+                if not np.any(roll[ii,i:(i+chunk)] > thresh):
+                    low[ii] = i
+                    break
+            #Where is there no absorption rightwards of the peak?
+            for i in xrange(high[ii],self.nbins,chunk):
+                if not np.any(roll[ii,i:(i+chunk)] > thresh):
+                    high[ii] = i+chunk
+                    break
+            #Shrink to width which has some absorption
+            ind = np.where(roll[ii][low[ii]:high[ii]] > thresh)[0]
+            if np.size(ind) != 0:
+                oldlow = low[ii]
+                low[ii] = np.max((ind[0]+oldlow,0))
+                high[ii] = np.min((ind[-1]+oldlow+chunk,self.nbins))
+        self.absorber_width[(elem, ion, minwidth)] = (low, high, offset)
+        return (low, high, offset)
+
+
+
     def get_observer_tau(self, elem, ion, number=-1, force_recompute=False, noise=True):
         """Get the optical depth for a particular element out of:
            (He, C, N, O, Ne, Mg, Si, Fe)
@@ -859,43 +941,6 @@ class Spectra:
             ntau = self.add_noise(self.snr, ntau, number)
         return ntau
 
-    def vel_width(self, elem, ion):
-        """
-           Find the velocity width of an ion.
-           This is the width in velocity space containing 90% of the optical depth
-           over the absorber.
-           elem - element to look at
-           ion - ionisation state of this element.
-        """
-        try:
-            return self.vel_widths[(elem, ion)]
-        except KeyError:
-            tau = self.get_observer_tau(elem, ion)
-            (low, high, offset) = self.find_absorber_width(elem, ion)
-            #  Size of a single velocity bin
-            vel_width = np.zeros(np.shape(tau)[0])
-            #deal with periodicity by making sure the deepest point is in the middle
-            for ll in np.arange(0, np.shape(tau)[0]):
-                tau_l = np.roll(tau[ll,:],offset[ll])[low[ll]:high[ll]]
-                (nnlow, nnhigh) = self._vel_width_bound(tau_l)
-                vel_width[ll] = self.dvbin*(nnhigh-nnlow)
-            #Return the width
-            self.vel_widths[(elem, ion)] = vel_width
-            return self.vel_widths[(elem, ion)]
-
-
-    def _vel_single_file(self,fn, elem, ion):
-        """Get the column density weighted interpolated velocity field for a single file"""
-        (pos, vel, elem_den, temp, hh, amumass) = self._read_particle_data(fn, elem, ion,True)
-        if amumass is False:
-            return np.zeros([np.shape(self.cofm)[0],self.nbins,3],dtype=np.float32)
-        line = self.lines[("H",1)][1215]
-        vv =  np.empty([np.shape(self.cofm)[0],self.nbins,3],dtype=np.float32)
-        phys = self.dvbin/self.velfac*self.rscale
-        for ax in (0,1,2):
-            weight = vel[:,ax]*np.sqrt(self.atime)
-            vv[:,:,ax] = self._do_interpolation_work(pos, vel, elem_den*weight/phys, temp, hh, amumass, line, False)
-        return vv
 
     def _get_mass_weight_quantity(self, func, elem, ion):
         """
